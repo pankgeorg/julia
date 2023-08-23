@@ -5,6 +5,8 @@ Support for sockets. Provides [`IPAddr`](@ref) and subtypes, [`TCPSocket`](@ref)
 """
 module Sockets
 
+@info "Using overrided sockets"
+
 export
     accept,
     bind,
@@ -139,6 +141,51 @@ function TCPServer(; delay=true)
     return tcp
 end
 
+const MAXSIZE = 500
+const accept_buffer_sync = Union{TCPSocket, Nothing}[nothing for i in 1:MAXSIZE]
+const first = Ref{Int64}(0)
+const last = Ref{Int64}(0)
+const HTTP429 = "HTTP/1.1 429 Too Many Requests\nContent-Type: text/html\nRetry-After: 60"
+
+
+function bufferready()
+    # Can insert an element at position (first[] % MAXSIZE)
+    # Will evict sockets if they don't fit
+    true
+end
+
+
+function addtobuffer(tcpsocket::TCPSocket)
+    i = first[] % MAXSIZE + 1
+    first[] += 1
+    ousted = accept_buffer_sync[i]
+    if !isnothing(ousted)
+        println("Going to oust $i")
+        last[] = last[] + 1
+        @async try
+            @info "Ousting first=$(first[]), last=$(last[])"
+            write(ousted, HTTP429)
+            close(ousted)
+        catch e
+            @info "Error while ousting $e"
+        end
+    end
+    accept_buffer_sync[i] = tcpsocket
+    return tcpsocket
+end
+
+function removefrombuffer()
+    if last[] < first[]
+        i = last[] % MAXSIZE + 1
+        tcpsocket = accept_buffer_sync[i]
+        accept_buffer_sync[i] = nothing
+        last[] += 1
+        return tcpsocket
+    else
+        return nothing
+    end
+end
+
 """
     accept(server[, client])
 
@@ -146,7 +193,12 @@ Accepts a connection on the given server and returns a connection to the client.
 uninitialized client stream may be provided, in which case it will be used instead of
 creating a new stream.
 """
-accept(server::TCPServer) = accept(server, TCPSocket())
+accept(server::TCPServer) = begin
+    socket = removefrombuffer()
+    !isnothing(socket) && return socket
+    accept(server, TCPSocket())  # fill buffer and "block"
+    return removefrombuffer()
+end
 
 function accept(callback, server::LibuvServer)
     task = @async try
@@ -682,11 +734,23 @@ function accept(server::LibuvServer, client::LibuvStream)
         throw(ArgumentError("server not connected, make sure \"listen\" has been called"))
     end
     while isopen(server)
+        i = 0
         err = accept_nonblock(server, client)
-        if err == 0
+        while err == 0 && i < MAXSIZE / 2  # Don't try to fill more than half the buffer
+            addtobuffer(client)
+            client = TCPSocket()
+            err = accept_nonblock(server, client)
+            i += 1
+        end
+        if first[] > last[]
+            iolock_end()
+            return
+        end
+        #=if err == 0
             iolock_end()
             return client
-        elseif err != UV_EAGAIN
+        else=#
+        if err != UV_EAGAIN
             uv_error("accept", err)
         end
         preserve_handle(server)
